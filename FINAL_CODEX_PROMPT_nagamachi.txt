@@ -1,0 +1,148 @@
+あなたはNagamachi BASEの予約/決済/鍵システムの安定化を担当するエンジニアです。
+このリポジトリ（claude_review_bundle_20260619 / 本番コードのコピー）に対して作業します。
+顧客が毎日使う本番システムです。事故ゼロ・運用最小・顧客体験ベストを最優先にしてください。
+
+対象:
+- liff_line_link_page/js/plan-b-app.js, booking-rules.js
+- netlify/functions/booking-api.js, stripe-webhook.js, line-webhook.js
+- apps_script/nagamachi_base_line_rich_menu/Code.gs
+- scripts/ 配下のテスト
+
+## 最重要ゴール
+A. 「決済が成立したのに、その予約枠が確保できていない」状態を“構造的に”発生させない。
+   自動返金・手動返金・手動復旧オペレーションを一切使わない。これが必要になる時点で設計が誤り。
+B. LIFFのタップ時の体感速度を上げる（予約画面の週送り・種別切替・初期表示）。
+C. LINE通知・自動返信のメッセージ内容と時刻表示に一切の誤りがないこと（後述。最重要級）。
+   ※クライアントから既に複数回の指摘あり。今回で確実に潰すこと。
+
+運用最小化（絶対要件）:
+オーナーの手作業は「入会フォーム申込みを確認して承認する」だけ。
+予約確定・鍵発行・失敗時の復旧・未払い対応・各種通知はすべて自動。
+既存の手動復旧メニューは、設計で“起きない”ようにするか自動トリガ化し、手作業を増やさない。
+
+## 守るべき不変条件（最重要）
+任意の予約枠に対し、全会員を通じて「いま支払い可能（open）な Stripe Checkout Session」は
+常に最大1つ。
+（同一会員の二重Sessionだけでなく、別会員が同じ枠に新Sessionを作ることも防ぐ）
+availability / createCheckout / resumeCheckout / cancelPendingReservation /
+checkout.session.expired webhook / reconcile の全経路でこの不変条件が破れないこと。
+
+## 確定済みの設計判断（オーナー承認済み。蒸し返さず、この前提で進める）
+1. 段階導入: A（前方互換の最小修正）を先に、B（本命）を後に。2段階で反映する。
+2. システム間連絡が遅れた場合は「枠を長めに保持する＝安全側」に倒してよい
+   （他会員が一瞬予約できない瞬間が出ても、二重予約・課金事故より優先）。
+3. 取りこぼし回収の自動リコンサイルを入れる。置き場所は実装者裁量、間隔は5〜10分。
+4. 決済ページ作成途中で中断した“宙ぶらりんの仮予約”は猶予5分で自動解放。
+5. 仮押さえ時間は35分（PLAN_B_PENDING_HOLD_MINUTES）を唯一の正本とする。
+6. reservationsシートに session_status / session_expires_at 列を追加してよい（additive、既存データ非破壊）。
+7. manual capture は採用しない（auto-capture維持）。将来、実際に返金が発生したら再検討。
+8. リコンサイルが「実は支払い済み」を検出したら、枠を解放せず鍵発行(fulfillment)へ回す。
+
+## 設計方針
+[A 最小修正 / 前方互換サブセット]
+- resumeCheckout の Stripe Session expires_at を「元の保持期限(created_at + 35分)」にキャップし延長させない。
+- createCheckout で同一枠の既存pendingがある場合、新規作成の前に旧 Stripe Session を必ず expire してから扱う
+  （Netlify側の既存 expireStripeCheckoutSession を共用。B/cancel/reconcileでも再利用する形にする）。
+- これらは後段Bがそのまま使う実装にし、捨てコードを出さないこと。
+
+[B 本命]
+- 枠の保持＝「pendingが存在し、そのSessionがまだ死んでいないこと」に一本化する。
+- 空き判定(availability)の pending 生存条件を、ローカル35分タイマー単独での解放から、
+  「checkout.session.expired Webhook ＋ 低頻度リコンサイル」での解放のみに切り替える。
+  Stripe Session状態を reservations にミラー(session_status / session_expires_at)し、空き判定はミラーを読む。
+- createCheckout は枠単位で get-or-reuse にし、supersede(作り直し)で2本目のSessionを生まない。
+  pendingは「Lock内で追加した瞬間から確定的解放イベントまで」枠を保持する（Session未attachでも保持）。
+- 枠が解放される唯一の経路: (a)決済成功 (b)明示キャンセル(expire成功が前提) (c)expired Webhook、のみ。
+  純粋なローカル時刻だけで枠を空ける処理は廃止する。
+- リコンサイル: 保持期限+猶予を超えたpending / 宙ぶらりんpendingを、StripeにSession状態を照会して整合させる。
+  dead→解放、paid→fulfillment。判断はStripeの事実に基づく（安全側）。
+- capture は auto-capture のまま。
+- 既存の LockService + planBFindReservationSlotConflict_ は“発火しない最終防壁”として残す。
+
+責務分担（厳守）:
+- Stripe Secret Key は Netlify 側のみ。Apps Script から直接 Stripe を叩かない。
+- expire は Netlify、ロック(LockService)＆Sheets台帳更新は Apps Script。
+- 順序は「Netlify側のStripe操作が成功 → その後 Apps Script が台帳を確定」の一方向。
+- 全処理を冪等にし、失敗時は「枠を保持し続ける安全側」に倒す。リコンサイルで自動回収する。
+- fulfillment / 解放は client_reference_id(=reservation_id) 基点で動く現状の堅牢性を維持する
+  （Session id の attach 失敗を許容できる性質を壊さない）。
+
+## C. LINE通知・自動返信の正確性（最重要級・必ず全数チェック）
+クライアントから「自動返信や通知文の時刻が違う」と複数回指摘されている。今回で根絶すること。
+- 日付・時刻の生成は全て Asia/Tokyo(JST) で行う。UTCずれ・日付の前後ズレ(日跨ぎで前日表示等)を完全に排除する。
+  Code.gs の日時整形（planBReservationDateLabel_ / planBNormalizeSheetDate_ / planBNormalizeSheetTime_ /
+  planBParseTokyoDateTime_ / planBFormatDateTime_ 等）を監査し、誤りを修正する。
+- 予約完了の会員通知・運営通知・7時/21時サマリーで表示される
+  「日付(曜日つき)・開始〜終了時刻・人数・料金・麻雀オプション」が、
+  予約確認画面 / quote / Stripe表示 / reservationsシート と完全に一致すること。
+- 「QRは予約開始5分前から終了10分後まで有効」と unlock_start_time(-5分)/unlock_end_time(+10分) の
+  値・文言が整合していること。
+- 決済後の会員通知・運営通知は「実際に課金が確定した後」に“ちょうど1回ずつ”飛ぶこと。
+  飛ばない／二重で飛ぶ／未確定(与信のみ)で飛ぶ、を禁止。
+  completed_line_notify_status / admin_line_notify_status による送信済み記録→再送防止を維持する。
+- お問い合わせ自動返信（line-webhook.js → processLineContactEvents_ → replyLineTextMessage_）と
+  画像受付の返信は挙動・文言を変えない。replyToken の有効期限内に返信する経路を壊さない。
+- 通知グループ登録、宛先の重複排除、サマリートリガ(7時/21時)の重複登録防止を壊さない。
+- 上記の時刻・日付・文面の正しさを自動テストで固定する
+  （scripts/test_plan_b_time_normalize.js を拡張し、メッセージ生成の時刻/日付/曜日も検証する）。
+
+## 顧客体験（深く考慮すること）
+- 通知文は矛盾なく、必要十分。時刻・料金・QRの使い方が一目で分かる。
+- 予約確認は「未来予約」と「未決済で対応が必要な予約」だけを表示し、過去予約で混乱させない。
+- 決済後は数秒で予約確認にQRが見える（confirm→success→QRの導線を遅くしない）。
+- タップは即時に反応し、待ち時間を最小化する。
+
+## 大原則：流れは変えず、中身だけ良くする（ふるまい保存）
+- 会員から見える画面遷移・操作・文言・APIの入出力契約は変えない。内部実装だけ良くする。
+- 既存ルート(apply/booking/booking-confirm/booking-success/booking-cancel/my-reservations/
+  pricing/guide/contact)とアクション(memberContext/prepareApplication/availability/availabilityRange/
+  quote/createCheckout/myReservations/resumeCheckout/cancelPendingReservation)の入出力契約は後方互換維持。
+- 「決済を再開」「未決済予約を取り消す」のpending復帰UIと導線は今までどおり動く。
+- やむを得ず外から見えるふるまいが変わる箇所は、勝手に変えず設計書に列挙してオーナー確認を取る。
+
+## 速度改善（B目標と別増分でよい・低リスク）
+- planBResolveMemberByIdToken_ の verifyLineIdToken_（毎API外部HTTPS）を CacheService 等で短期キャッシュ。
+- availabilityRange の全行走査を期間で絞る／会員・日付インデックス化。7日分を1回取得し、近接週はクライアントでプリフェッチ/キャッシュ。
+- タップは楽観的UI。二重送信防止はサーバ整合(不変条件)で担保されるのでUIは速さ優先でよい。
+- before/after の体感箇所を計測してレポートする。
+
+## 禁止事項（厳守）
+- 本番反映・外部サービスへの実操作を勝手に行わない:
+  clasp push / clasp deploy / netlify deploy --prod / Stripe実操作 / LINE設定変更 / KEYVOX実操作 は実行禁止。
+- 本番の Apps Script / Netlify / Stripe / LINE / KEYVOX / Google Sheets を変更しない。
+- .env / .clasp.json / .clasprc.json / 各種トークン・個人情報をコミットしない・出力しない。
+- 破壊的・不可逆な操作の前は必ず目的・影響範囲・リスクを説明して確認を取る。
+
+## 進め方（段階を厳守）
+段階0: 確定判断(上記)を反映した DESIGN_no_paid_without_slot.md を出し、一旦提示して短く確認を取る。
+段階1(A): 実装＋テスト緑。本番反映はせず、Aのデプロイ手順書(Apps Script先→Netlify、cacheキー更新、ロールバック)を添えて提出。
+          → オーナーがA反映・確認するまで停止。
+段階2(B): 承認後に実装＋テスト緑。本番反映はせず、Bのデプロイ手順書を添えて提出。
+各段階で npm test 全緑、node --check 通過、追加テストで受け入れ基準を満たすこと。
+clasp push / netlify --prod / Stripe・LINE・KEYVOX実操作は実行しない。
+
+## 受け入れ基準（自動テスト化）
+- クロス会員: 会員Aが枠X保持中、会員Bが枠Xでcreate→不可。
+- 取り直し(同会員同枠): 再createで新規pending/Sessionを量産せず1本に収束。
+- 旧Session決済: 解放前に必ずexpire。expire不可(=既paid)なら解放せずfulfillmentへ。
+- 二重Session/二重課金が発生しない。
+- 期限切れ: ローカル時刻単独で枠が空かない。expired Webhook or リコンサイルでのみ解放。
+- attach失敗でも paid → completed webhook が client_reference_id で確定。
+- 宙ぶらりんpending → 猶予5分でリコンサイルが安全に解放。
+- 決済前は鍵/QRを返さない既存ゲート維持（pendingでQR非表示）。
+- LINE: 決済後通知が課金確定後にちょうど1回。時刻/日付/曜日/人数/料金/オプションが全面一致。
+        お問い合わせ自動返信・画像受付返信が従来どおり（回帰）。
+- 初回会費決済Webhook経路が予約Checkout変更で壊れない（回帰）。
+- 3件上限・サマリーの active 判定が新ロジックで誤らない。
+- 回帰: Stripe商品表示名が日時/種別/人数/料金から生成され「EC物販」等に戻らない。
+       予約確認でQRは初期非表示・「QRを開く」押下時のみ表示。
+       料金/ガイド見出しのトンマナ(先頭■・#dc143c)維持。
+       予約確認は未来＋未決済要対応のみ・過去は基本非表示。
+       タップ改善が二重送信/二重予約/古い状態(キャッシュ)表示を起こさない。
+- KEYVOX空き照会は予約可否判定に戻さない。
+
+## 出力フォーマット
+- 段階0: DESIGN_no_paid_without_slot.md（確定判断反映）＋確認したい論点。
+- 段階1/2: 変更点サマリ、追加テスト一覧、テスト結果(緑)、LINE時刻/文面チェック結果、
+           before/after速度メモ、デプロイ手順書。
+いきなり全部書かず、段階0→段階1(A)→（承認）→段階2(B) の順で、各段階で停止して提出すること。
