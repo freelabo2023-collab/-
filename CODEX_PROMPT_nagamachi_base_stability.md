@@ -81,6 +81,15 @@ B. LIFFのタップ時の体感速度を上げる（特に予約画面の週送�
 
 6. 既存の LockService + planBFindReservationSlotConflict_ は“発火しない最終防壁”として残す。
 
+7. 既存のLINE通知を壊さないこと（明示要件）:
+   - お問い合わせ自動返信（line-webhook.js → processLineContactEvents_ → replyLineTextMessage_）と
+     画像受付の返信は今回の変更対象外。挙動を変えない。
+   - 決済後の「会員向け予約完了通知」と「運営向け予約通知」は、
+     “実際に課金が確定した後（manual captureならcapture成功後、auto captureなら入金確定後）に、
+     ちょうど1回ずつ”飛ぶこと。飛ばない／二重で飛ぶ／与信のみ(未確定)で飛ぶ、を禁止する。
+   - 7時/21時のサマリー通知トリガ、通知グループ登録、宛先の重複排除も挙動を変えない。
+   - completed_line_notify_status / admin_line_notify_status による“送信済み記録→再送防止”を維持する。
+
 ## 速度改善（B）の具体方針
 - planBResolveMemberByIdToken_ の verifyLineIdToken_（毎API外部HTTPS）を CacheService 等で
   短期キャッシュし、週送り/種別切替のたびに外部検証が走らないようにする。
@@ -124,6 +133,8 @@ B. LIFFのタップ時の体感速度を上げる（特に予約画面の週送�
 - 二重Session/二重課金が発生しないこと。
 - 期限切れ: ローカル時刻単独で枠が空かないこと。expired Webhook受信またはリコンサイルでのみ解放。
 - 決済成功後、status/key_issue_status の確定と、会員/運営/グループ通知が二重送信されないこと。
+- 決済後の会員通知・運営通知が、課金確定後に“ちょうど1回ずつ”飛ぶこと（飛ばない/二重/未確定での送信を禁止）。
+- お問い合わせ自動返信・画像受付返信が従来どおり動作すること（回帰テスト）。
 - 決済前は鍵/QRを返さない既存ゲートが維持されること（pendingでQRが出ない）。
 - 金額・人数・麻雀オプション・日時が 画面/quote/Stripe line item/reservationsシート/LINE通知 で一致すること。
 - 万一の競合検出時に“返金”が発生しないこと（void もしくは構造上未到達）。
