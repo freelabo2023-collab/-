@@ -1,0 +1,42 @@
+QR表示の改善タスクです（B・LINEグループ設定とは別件）。
+まずSTEP1（読み取り確認）をやり、報告して停止すること。担当者GO後にだけSTEP2（実装）へ進む。いきなり実装・本番反映はしない。
+
+## 背景・ゴール
+- ドア解錠は「リーダーにQRをかざす」方式 ＝ スキャンできるQR“画像”が必要。
+- 現状「QRを開く」を押すとLINE内ブラウザでKEYVOXの操作ページが開き、Android等の一部端末で表示/操作できない。
+- ゴール: どの端末（Android / iPhone / iPad / タブレット）でもQRが見られること。できればLINE(LIFF)内で完結。難しければ外部ブラウザで開くでよい。
+- できるだけ単純な作りにする。KEYVOXの設定・鍵発行ロジックは変更しない。
+
+## 厳守事項
+- KEYVOX操作・設定変更・新規予約作成・決済・LINE送信・本番反映は勝手にしない。
+- STEP1は完全に「読み取りのみ」。台帳の編集・新規予約は禁止。
+- clasp push / clasp deploy / netlify --prod / Stripe / LINE設定 / KEYVOX は担当者GO後のみ。
+- iOSの既存挙動を壊さない。決済前はQRを出さない既存ゲート（paid かつ key issued かつ会員OK）を維持。
+- 作業は既存タブで。新規タブ/作業コピーを増やさない。必要ファイルは自分で読む。
+
+## STEP1: 読み取り確認（実装しない・報告して停止）
+目的: KEYVOXが返す鍵リソースが「QR画像」か「操作ページ」かを確定する。
+- 直近のtest予約（最新のpaid/issued行）の key_qr_url / checkin_url / key_qr_code / key_share_url / key_delivery_source の実値を読み取る（編集しない）。
+- 各URL（特に key_qr_url）が「画像」か（例: /download/img/qr/…、.png/.jpg/.svg、data:image）「操作ページ」かを判定。
+  必要なら read-only の HTTP GET で Content-Type を1回だけ確認（KEYVOXの新規注文は作らない）。
+- 関連コードを確認: planBSelectKeyvoxKeyResource_（サーバの鍵リソース選定）、renderReservationKeyHtml / keyImageUrlFromQrCode（LIFFの表示分岐）。
+  なぜ今「画像表示」ではなく「リンク(QRを開く)」になっているかを説明する。
+- 報告に含める:
+  - 各フィールドの実体（画像URL / ページURL / コード文字列 のどれか）
+  - 最もシンプルな方式の判定: 方式1=LIFF内にQR画像をインライン表示 / 方式2=外部ブラウザで開く
+  - 推奨と理由、想定変更ファイル（できれば plan-b-app.js のクライアント変更だけで済むか）、デプロイ範囲（Netlifyのみで済むか）
+- ここで停止し、担当者の確認を待つ。
+
+## STEP2: 実装（GO後のみ）
+確認結果に応じて、最もシンプルな方法で実装:
+- 画像が得られる場合 → renderReservationKeyHtml で QR を <img> でインライン表示（スキャンしやすいサイズ＋必要なら拡大）。既存の有効時間の注意書きは残す。
+- 画像が無く操作ページのみの場合 → そのページを外部ブラウザで開く（既存の openExternalUrl / liff.openWindow external を流用）＋「リンクをコピー」等のフォールバック。
+- 画像/ページの判定は単純で堅牢に（拡張子・KEYVOXのQR画像パス・data:image など）。サーバ側フラグにしてもよいが、クライアントだけで済むなら優先。
+- iOSの既存表示を壊さない。決済前は出さないゲートを維持。
+- テスト: scripts/test_plan_b_liff_route_login.js 等に「QRが画像で表示される / ページは外部で開く / pendingでは出ない」を追加。
+- npm test / node --check 緑。本番反映はせず、変更差分・テスト結果・反映手順（LIFFは Netlify --no-build 方式）を出して停止。
+
+## 確認の前提
+- 最終的な「Android実機でQRが表示・スキャンできる」確認はCodexでは不可。クライアントのAndroid実機での確認が必要、と報告に明記する。
+
+出力: まず STEP1 の報告（各フィールドの実体＋推奨方式＋変更範囲）を出して停止すること。
