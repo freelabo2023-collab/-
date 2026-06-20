@@ -1,8 +1,8 @@
-Nagamachi BASE 安定化作業の続きです（新チャット引き継ぎ）。
+Nagamachi BASE 安定化作業の続きです（新チャット引き継ぎ・2026-06-20更新）。
 作業ディレクトリ: /Users/taiki/Documents/New project
 
 このチャットでは B段階 と QR(Android)修正 を扱います（具体的な実施指示は別メッセージで渡します）。
-A段階は前チャットで本番反映済みです。まず現状把握から入り、いきなり実装・本番反映・KEYVOX・LINE設定・Stripe live操作はしないでください。
+A段階は前チャットで本番反映済み（＋3件カウントhotfix @89 も反映済み）。まず現状把握から入り、いきなり実装・本番反映・KEYVOX・LINE設定・Stripe live操作はしないでください。
 
 ## 作業ルール（環境整理・厳守）
 - 必要なファイルは自分で探して読むこと。添付は不要。作業ディレクトリ配下を git status / git diff も含めて自分で把握する。
@@ -12,15 +12,18 @@ A段階は前チャットで本番反映済みです。まず現状把握から�
 
 ## まず最初に自分で開いて読むファイル
 - /Users/taiki/Documents/New project/A_PROD_DEPLOY_REPORT_20260620.md
+- /Users/taiki/Documents/New project/A_SMOKE_PROGRESS_20260620.md
 - /Users/taiki/Documents/New project/A_REVIEW_PACKET.md
 - /Users/taiki/Documents/New project/DESIGN_no_paid_without_slot.md
 - /Users/taiki/Documents/New project/STAGE_A_IMPLEMENTATION_REPORT_20260619.md
-（加えて git status / git diff で実コードの最新状態を確認する。実コードが正本。A_REVIEW_PACKETは①②修正前の版なので注意。）
+（加えて git status / git diff で実コードの最新状態を確認する。実コードが正本。A_REVIEW_PACKETは①②修正・@89 hotfix 前の版なので注意。）
 
 ## A段階の現状（本番反映済み）
-- Apps Script 本番deployment: AKfycbyOs...PF5w @88
+- Apps Script 本番deployment: AKfycbyOs...PF5w @89
+  - @88: A段階本体（取り直し再利用 / attach後URL返却 / resume期限キャップ / LINE本文純粋関数化 ほか）
+  - @89: hotfix。過去の paid 等を3件上限カウントから除外（下記ガード7参照）。
 - Netlify production: https://nagamachi-base-liff.netlify.app
-- Netlify deploy: 6a35c1a05ac75d1fdd739b33
+- Netlify deploy: 6a35c1a05ac75d1fdd739b33（@89はApps Scriptのみ。Netlifyは変更なし）
 - Stripeはテスト決済モード sk_test_ のまま維持。LINE Developers/公式アカウント設定・KEYVOX設定・Stripe live設定は未変更。
 
 ## Netlifyデプロイ注意（必読・地雷）
@@ -41,20 +44,16 @@ A段階は前チャットで本番反映済みです。まず現状把握から�
 - 下記の実機通し確認は人(担当者)がiPhone＋テスト決済＋自分のLINEで行う。Codexは実行できない。
 - この実機確認が「緑」だと担当者が確認するまで、Bの本番反映に進まない。Codexは結果を担当者に尋ね、緑でなければ反映に進まない。
 - Bのコード実装は先行してよいが、B本番反映はこのゲート通過後。実機確認でAに問題が見つかったら、Bより先にAの是正を優先する。
-- 実機チェックリスト:
-  - 新規予約を実際に入れる
-  - Stripe決済ページを開いて戻る（中断）
-  - 予約確認から決済再開
-  - 未決済予約取消／取消後に同枠取り直し
-  - 決済成功後に予約確認でQRが表示される／pendingではQRが出ない
-  - 会員向けLINE予約完了通知が1回／運営向けLINE通知が1回
-  - 日時/曜日/人数/料金/麻雀が、予約確認・Stripe・LINE通知で一致
-  - Session自然期限切れ後の枠解放を本番で1回だけ約35分実地確認
+- 実機チェックリスト（進捗は A_SMOKE_PROGRESS_20260620.md 参照）:
+  - 新規予約／決済ページを開いて戻る（中断）／決済を再開／未決済取消／取消後に同枠取り直し … 済み
+  - 残り: 決済“完了”後に予約確認でQRが表示される（pendingでは出ない）
+  - 残り: 会員向けLINE予約完了通知が1回／運営向けLINE通知が1回／日時・人数・料金一致
+  - 残り: Session自然期限切れ後の枠解放を本番で1回だけ約35分実地確認
 
 ## 確定済み8判断（B実装はこれに従う）
 1. 段階導入。Aを先に入れ、確認後にBへ進む。
 2. システム間連絡が遅れた場合は「枠を長めに保持する」安全側に倒す。
-3. 取りこぼし回収のリコンサイルを入れる。ただし専用の高頻度トリガは新設せず、既存の定期処理に相乗りする。
+3. 取りこぼし回収のリコンサイルを入れる。ただし専用の高頻度トリガは新設せず、既存の定期処理に相乗りする（実効15〜30分、空振りはStripe/Netlifyを呼ばない、空き表示の経路に挟まない）。
 4. 決済ページ作成途中で中断した宙ぶらりん仮予約は、猶予5分で自動解放対象。
 5. 仮押さえ時間は35分、PLAN_B_PENDING_HOLD_MINUTES を唯一の正本にする。
 6. reservationsシートに session_status / session_expires_at 列を追加してよい（additive・既存データ非破壊）。
@@ -68,14 +67,17 @@ A段階は前チャットで本番反映済みです。まず現状把握から�
 4. LINE時刻ズレは原因を明記し、日跨ぎ・シートDate正規化・曜日・終了+10分などをゴールデンテストで固定する。
 5. error_paid_conflict はB導入後は発生しない前提。万一発生時は運営へ自動アラートし、無言でレコード削除しない。返金もしない。
 6. reconcile用Netlifyエンドポイントは、外部から任意のStripe session idを処理させない。予約由来IDのみ・別token認証・token無し拒否。
-7. 3件上限・サマリー集計が新active判定でズレない。expired/payment_failed/cancelledは数えない。一時的な長め保持が3件上限に少し影響するのは許容。
+7. 3件上限・サマリー集計が新active判定でズレない。expired/payment_failed/cancelledは数えない。
+   ★@89で「過去の paid/confirmed/key_issued/checked_in/payment_authorized・error+paid」を3件上限から除外済み
+     （planBReservationIsActive_ が planBReservationIsUpcomingForMember_ を使う形）。画面の過去非表示とカウントを同一基準に統一。
+     Bで active 判定を作り替える際も「過去paidは数えない・画面とカウントは同一基準」を必ず維持すること。
 
 ## このチャットで扱うもの（詳細な実施指示は別メッセージで渡す）
 - B段階: 枠の保持を「Stripe Sessionが死んでいないこと」に一本化（session_status/session_expires_at ミラー、get-or-reuse、reconcile、auto-capture維持）。詳細・テスト計画は別途。
 - 別タスク QR(Android)修正: KEYVOX非変更・iOSを壊さない・外部ブラウザで開く方向・Android実機はクライアント確認・Bと混ぜない。詳細は別途。
 
 ## 進め方（このチャットの最初の一手）
-1. 上記4ファイルと git status / git diff を自分で読んで現状把握する。
+1. 上記5ファイルと git status / git diff を自分で読んで現状把握する。
 2. A段階の実機通し確認がどこまで終わったかを担当者に確認する。
 3. その後のB実施指示を待つ。受け取ったら、着手前に影響範囲・テスト計画・反映手順・ロールバックを短く提示する。
 4. 本番反映は人の承認ゲート後。勝手に進めない。
