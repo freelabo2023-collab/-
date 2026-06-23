@@ -1,0 +1,201 @@
+Nagamachi BASE 安定化 — 設計判断レポート（実装前 / コードは書かない）
+
+==============================================================
+0. 前提と不変条件（強化版）
+==============================================================
+守るべき不変条件（最重要）:
+  任意の予約枠に対し、全会員を通じて「いま支払い可能（open）な Stripe Checkout Session」は
+  常に最大1つ。
+
+現状はこれが破れ得る。原因は「枠の保持」を2つの別時計で持っているため:
+- 時計A: Sheets pending の created_at + PLAN_B_PENDING_HOLD_MINUTES(35分) のローカルタイマー
+- 時計B: Stripe Session の寿命（resumeCheckout で延長され得る）
+
+時計Aが先に枠を解放 → 別会員が同じ枠で新Session作成 → 旧会員のSessionがまだ払える
+→ 同一枠に支払い可能Sessionが2本 → 片方が conflict_after_payment（課金済み・鍵なし・手動返金）に落ちる。
+
+
+==============================================================
+1. A / B / C 比較
+==============================================================
+
+[A 最小修正]
+- 中身: ①resumeのexpires_atを保持期限にキャップ ②取り直し時に旧Sessionを必ずexpireしてから再作成（Netlify）
+- 防げる事故: 現実に起きる2経路（resume延長／取り直しで旧Session生存）を封殺
+- 防げない事故: 35分境界の数秒レース（Stripe expireとGAS時計のズレ）。発生時もデータは安全だが、ごく稀に手動返金が残る
+- 実装量: 小（局所2点＋テスト）
+- 本番リスク: 低
+- 運用負担: ほぼ増えない
+- 返金ゼロの度合い: 実質ゼロ（理論的境界レースは残る）
+- おすすめ度: ◯（応急・前出し）
+
+[B 中規模（本命）]
+- 中身: Aに加え、枠の保持＝「pendingが存在し、そのSessionがまだ死んでいないこと」に一本化。
+        空き解放はローカルタイマーをやめ、checkout.session.expired Webhook＋低頻度リコンサイルのみ。
+        createCheckoutは(枠)単位でget-or-reuse。auto-capture維持。
+- 防げる事故: 上記＋35分境界の数秒レースも構造的に消滅。クロス会員での二重Sessionが原理的に起きない
+- 防げない事故: 実質なし。Webhook遅延は「枠を長めに保持＝安全側」に倒れ、リコンサイルが回収
+- 実装量: 中（空き判定ホットパス改修＋Session状態ミラー＋リコンサイル＋get-or-reuse）
+- 本番リスク: 中（空き判定を触る＝要テスト。ただし失敗は安全側に倒れる設計）
+- 運用負担: 増えない（全自動。リコンサイルも自動）
+- 返金ゼロの度合い: 構造的ゼロ（auto-captureで未到達）
+- おすすめ度: ◎
+
+[C 大規模]
+- 中身: Bに manual capture（与信→確定/void）を追加
+- 防げる事故: Bと同じ
+- 防げない事故: 実質なし
+- 実装量: 大（B＋capture/void経路＋新失敗状態＋サービス間往復増）
+- 本番リスク: 高め（与信期限切れ／capture失敗／Netlify⇄AppsScript往復での状態割れ＝新しい事故源）
+- 運用負担: 与信期限・capture失敗監視という新運用が増えうる
+- 返金ゼロの度合い: 数学的ゼロ（残余もvoid=未課金）
+- おすすめ度: △（現状は過剰／将来保険）
+
+推奨: B を本命に。A は“Bの前方互換な部分集合”として先行リリース可。C は保留。（理由は §3）
+
+
+==============================================================
+2. 強化不変条件を各経路で検証
+==============================================================
+
+- availability:
+  現状: pendingを created_at+35分 で active 判定 → 35分後に他会員へ枠開放（Sessionが生きていても）
+  B: pendingは「作成〜確定的解放イベント」まで枠を保持。解放は (a)決済成功 (b)cancel(expire成功後)
+     (c)expired Webhook のみ。早期解放しない＝二重Sessionが生まれない
+
+- createCheckout:
+  現状: LockService内でavailability確認→pending作成。ここは元々クロス会員で直列化されOK。
+        だが作成後の解放が早すぎる
+  B: Lock内で「枠が他者に保持されていれば不可／自分の同枠pendingがあれば再利用／無ければ新規」。
+     pendingは追加した瞬間から枠を保持（Session未attachでも保持）→ attach前でも他者は入れない
+
+- resumeCheckout:
+  現状: 新Sessionのexpires_atを now+35 で延長 → 保持を超えて生存
+  B: expires_atを元の保持期限にキャップ。openなら再利用、駄目なら旧をexpireしてから1本だけ作る
+
+- cancelPendingReservation:
+  現状: Netlifyで先にexpire→Apps Scriptでcancelled（ここは既に正しい）
+  B: 維持。expire成功（or既paid判定）を前提に解放
+
+- checkout.session.expired webhook:
+  現状: stripePaymentFailedで payment_failed 化（=解放）。client_reference_id基点で動く
+  B: これを枠解放の正規イベントに格上げ。ミラー(session_status)も更新
+
+- reconcile（新規）:
+  現状: なし
+  B: Webhook欠落・orphan pending（session未attachで放置）を回収。Stripeへ状態照会し、deadなら解放／
+     paidならfulfillmentへ。判断はStripeの事実に基づくため安全側
+
+重要な堅牢ポイント（現状コードの良い性質）:
+  fulfillment も payment_failed も client_reference_id（=reservation_id）基点で動くため、
+  「Stripe Session作成後にattach（id保存）が失敗」しても、決済されれば completed webhook が
+  予約を特定して確定できる。＝attach失敗を許容できる。Bはこの性質を維持する。
+
+
+==============================================================
+3. 推奨と段階導入（「A先出し」の是非）
+==============================================================
+結論: A を“Bに吸収される前方互換な部分集合”として先に出し、続けて B を入れる。C は保留。
+
+ただし A の作り方に条件がある。Aの「②取り直し時に旧Sessionをexpire」を supersede（cancelしてから
+新規作成）方式で実装すると、Bで supersede 自体を廃止するため作り直しになる（捨てコードになる）。
+そこで A は次の“Bが必ず再利用する”形に限定する:
+
+- A1: resumeのexpires_atキャップ → B もそのまま使う（捨てない）。
+- A2: createCheckoutで同枠の既存pendingがあれば、新規作成の前にNetlifyでそのSessionをexpireする
+      （＝Bの「get-or-reuse」へ橋渡し。Netlifyの“session expire”ヘルパー（既存 expireStripeCheckoutSession）は
+        B/cancel/reconcileでも共用）。
+
+この形なら A→B は積み増しで、捨てコードが出ない。Aで現実の事故を即日下げ、Bで境界レースまで
+構造的に消す、という安全な段階導入になる。
+
+補足: 「A+B同時リリースでも可」だが、Bは空き判定ホットパスを触るため回帰検証に時間がかかる。
+A先行で露出時間を最小化し、Bを落ち着いて検証する方が安定化の趣旨に合う、というのが推奨理由。
+Codex（＝実装者）が異なる判断をするなら、設計書で根拠を示すこと。
+
+
+==============================================================
+4. 影響範囲（B目標時）
+==============================================================
+契約は不変（ルート名・アクション名・レスポンス項目・pending復帰UIは現状維持）。内部のみ変更。
+
+netlify/functions/booking-api.js:
+- createCheckout: get-or-reuse化（Apps Scriptへ「同枠の既存pending有無」を問い合わせ→再利用 or 新規）
+- resumeCheckout: expires_atキャップ、1本化
+- cancelPendingReservation: 現状維持（expire→cancel）
+- expireStripeCheckoutSession: cancel/reconcile/get-or-reuseで共用
+- （新規）reconcileエンドポイント（スケジューラから叩く想定）
+
+apps_script/.../Code.gs:
+- planBReservationIsActive_ / planBBuildAvailability_: pending生存判定を「ローカル35分タイマー」から
+  「Session状態ミラー基準（確定的解放イベントまで保持）」へ。
+  ← 最重要かつ最要注意（countActiveの3件上限・サマリーでも使われるので副作用確認）
+- planBCreatePendingReservation_: get-or-reuse（Lock内）
+- planBSupersedeMemberPendingForSlot_: 廃止 or 「expire後に解放」へ置換
+- planBStripePaymentFailed_（expired受け口）: 枠解放＋ミラー更新の正規経路に
+- planBAttachStripeCheckoutSession_: ミラー（session_status / session_expires_at）も保存
+- getPendingReservationForCheckout_ / cancelPendingReservation_: 整合
+- （新規）reconcile候補抽出（Stripe照会はNetlify側に委譲）
+
+netlify/functions/stripe-webhook.js:
+- checkout.session.expired→stripePaymentFailedを維持（必要ならsession.statusも転送）。
+  初回会費決済の分岐は不変
+
+liff_line_link_page/js/plan-b-app.js: 基本不変（速度改善は別増分）
+
+Sheetsスキーマ: session_status / session_expires_at 列を追加（additive＝安全）。
+  PLAN_B_RESERVATION_HEADERS拡張
+
+scripts/: 回帰＋新規結合テスト追加
+
+速度改善（別増分・低リスク）:
+  idToken検証の短期キャッシュ、availabilityRangeの期間絞り込み、近接週プリフェッチ。
+  契約・枠ロジックに影響しないので独立して入れられる。
+
+
+==============================================================
+5. テスト案
+==============================================================
+自動（scripts/、既存ハーネスに追加）:
+- クロス会員: 会員Aが枠Xを保持中、会員Bが枠Xでcreate→不可
+- 取り直し（同会員同枠）: 再createで新規pending/Sessionを量産せず1本に収束
+- 旧Session決済: 解放前に必ずexpire。expire不可（=既paid）なら解放せずfulfillmentへ
+- 期限切れ: ローカル時刻単独で枠が空かない。expired Webhook or リコンサイルでのみ解放
+- attach失敗でも paid → completed webhookが client_reference_id で確定
+- orphan pending（session未attachで放置）→ リコンサイルが安全に回収
+- 決済前は鍵/QRを返さない既存ゲート維持（pendingでQR非表示）
+- LINE通知: 決済後の会員/運営通知が課金確定後にちょうど1回。お問い合わせ自動返信・画像受付は不変（回帰）
+- 初回会費決済Webhook経路が予約Checkout変更で壊れない（回帰）
+- 3件上限・サマリーの active 判定が新ロジックで誤らない
+
+手動（本番で目視）:
+- Stripe商品表示名が日時/種別/人数/料金から生成され「EC物販」等に戻らない
+- 予約確認でQRは初期非表示、「QRを開く」押下時のみ表示
+- 料金/ガイド見出しのトンマナ（先頭■・#dc143c）維持
+- 予約確定画面・LINE通知・Stripe表示で日時/人数/料金一致
+- 予約確認は「未来予約＋未決済で要対応」のみ、過去予約は基本非表示
+- タップ改善が二重送信/二重予約/古い状態表示を起こさない
+
+
+==============================================================
+6. 実装前の確認事項（オーナー判断が必要）
+==============================================================
+1. 段階導入: 推奨どおり「A（前方互換サブセット）→B」で進めてよいか／A+B一括が良いか。
+2. 保持＝Stripe真実の意味: 「Webhook遅延時は枠を長めに保持（＝他会員が一時的に予約不可）」という
+   安全側の振る舞いを許容してよいか。
+3. リコンサイルの置き場所: Netlify Scheduled Function か、Apps ScriptのタイマートリガからNetlifyを叩くか
+   （Stripe鍵はNetlifyのみ前提）。頻度（例: 5–10分）。
+4. orphan pending の猶予: session未attachで放置されたpendingを解放するまでの猶予（例: 5分）。
+5. 保持時間の正本: PLAN_B_PENDING_HOLD_MINUTES=35 を「枠保持＝Session expires_at」の正本として
+   固定してよいか（Stripeが35分で自動失効→expired Webhookで解放、という前提）。
+6. スキーマ追加: session_status / session_expires_at 列追加（additive）でよいか。
+7. manual capture(C)は保留でよいか（実際に返金が一度でも発生したら再検討）。
+8. リコンサイルがpaidを検出した場合は解放でなく fulfillment（鍵発行）へ回す、という扱いでよいか。
+
+
+==============================================================
+進め方
+==============================================================
+- これは「コードを書く前」の判断材料。この内容で DESIGN_no_paid_without_slot.md として確定し、
+  §6の8項目に回答を得てから、段階2（実装＋テスト）へ進む。
+- オーナー承認までコードは書かない。

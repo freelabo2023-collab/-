@@ -1,0 +1,73 @@
+B段階の実施指示です。冒頭に貼った引き継ぎ（確定8判断・7ガード・重要前提・Bの前提ゲート・Netlifyデプロイ注意）に従ってください。
+いきなり実装・本番反映はしないでください。まずB-0を出して停止すること。
+
+## 目的（B段階）
+「払ったのに枠なし」を構造的に消す。枠の保持を「pendingが存在し、そのStripe Sessionがまだ死んでいないこと」に一本化する。
+auto-capture維持。返金・手動復旧をゼロにする。会員から見える流れは変えない（中身だけ良くする）。
+
+## 不変条件（最重要）
+任意の予約枠に対し、全会員を通じて「いま支払い可能(open)なStripe Checkout Session」は常に最大1つ。
+availability / createCheckout / resumeCheckout / cancelPendingReservation / checkout.session.expired webhook / reconcile
+の全経路でこれが破れないこと。
+
+## 進め方（段階厳守・各段で停止して提出）
+B-0（まず設計確認・実装しない）:
+  DESIGN_no_paid_without_slot.md を踏まえ、影響範囲・テスト計画・反映手順・ロールバックを「短く」提示して停止。担当者の確認を待つ。
+B-1（承認後に実装）:
+  実装＋テスト緑（npm test / node --check）。反映はせず、変更点サマリ・追加テスト一覧・テスト結果・回帰チェック結果・反映手順書を添えて提出して停止。
+B-2（反映）:
+  Aの実機通し確認が緑＋担当者のGOが出てから反映。Apps Script先→Netlify（--no-build方式）→スモークチェック→結果報告。異常時は即ロールバック。
+
+## B実装スコープ
+- 枠の保持を「Stripe Sessionが死んでいないこと」に寄せる。
+- availabilityのpending生存条件を、ローカル35分タイマー単独解放ではなく、checkout.session.expired Webhook + 低頻度reconcileでの解放へ。
+- Stripe Session状態を reservations にミラー（session_status / session_expires_at を追加・additive・既存データ非破壊）。
+  値の用途を1行コメントで明記（complete と paid は今回ほぼ同義）。
+- createCheckout は枠単位で get-or-reuse。supersedeで2本目のSessionを作らない。
+- pendingはLock内で追加した瞬間から、決済成功・明示キャンセル・expired Webhook・reconcile判断まで枠を保持。
+- 純粋なローカル時刻だけで枠を空ける処理は廃止。
+- reconcile: 保持期限+猶予を超えたpending / 宙ぶらりんpendingを、Netlify経由でStripe照会して整合。
+  deadなら解放、paidならfulfillment、openなら保持。判断はStripeの事実に基づく。
+- capture は auto-capture のまま。
+- 既存の LockService + planBFindReservationSlotConflict_ は最終防壁として残す（発火しない前提）。
+- Apps Script から Stripe Secret Key を扱わない。Stripe操作はNetlifyのみ。
+
+## reconcileの軽さ条件（厳守）
+- 専用の高頻度トリガは新設せず、既存の定期処理に相乗り。実効15〜30分相当。
+- 対象がゼロなら即終了し、その時は Stripe/Netlify を呼ばない（軽い空振り）。
+- availability（空き表示）のホットパスに Stripe 往復や reconcile を挟まない（速度を落とさない）。
+- reconcile用Netlifyエンドポイントは別token認証・予約由来IDのみ・token無し拒否（7ガード6）。
+
+## 壊してはいけない（ふるまい保存・回帰）
+- ルート/アクション名・入出力契約は後方互換維持（画面遷移・操作・文言は変えない）。
+- 「決済を再開」「未決済予約を取り消す」のpending復帰UI・導線は維持。
+- 決済前は鍵/QRを返さない既存ゲート（pendingでQR非表示）／決済後は表示。
+- 決済後の会員/運営LINE通知は課金確定後にちょうど1回。お問い合わせ自動返信・画像受付は不変。
+- 初回会費決済のWebhook経路（client_reference_id分岐・メール照合・会員登録完了通知）を壊さない（同じstripe-webhookを共有）。
+- fulfillment/解放が client_reference_id 基点で動く堅牢性を維持（attach失敗を許容できる性質を壊さない）。
+- 予約確認は未来＋未決済要対応のみ・過去は基本非表示。Stripe商品名はEC物販に戻さない。見出しトンマナ(■/#dc143c)維持。
+- KEYVOX空き照会は予約可否判定に戻さない。
+
+## 受け入れ基準（自動テスト化）
+- クロス会員: 会員Aが枠X保持中、会員Bが枠Xでcreate→不可。
+- 同一会員同一枠: createCheckout再実行で同じreservation/Sessionへ収束（量産しない）。
+- checkout.session.expired で session_status=expired となり枠解放。
+- session_expires_at 超過“だけ”では枠解放しない（Webhook/reconcileで初めて解放）。
+- reconcileが open/expired/paid を正しく反映。paid検出は解放せず fulfillment。
+- 宙ぶらりんpending（session未attach）が5分超で安全に解放。
+- 決済前は鍵/QR非表示・決済後は表示、の既存ゲート維持。
+- LINE通知が課金確定後にちょうど1回・時刻/人数/料金一致（既存ゴールデンテスト維持）。
+- 初回会費Webhook経路が壊れない（回帰）。
+- 3件上限・サマリーが新active判定でズレない。
+- KEYVOX空き照会を予約可否に使っていない。
+
+## デプロイ/ロールバック（B-2）
+- Apps Script先（列追加・新action・新active判定・reconcile相乗り）→ Netlify（reconcileエンドポイント・Sessionミラー、--no-build方式）。
+- 反映後スモークチェック（A実機チェックリスト＋クロス会員/期限切れ解放/reconcile動作）。
+- 異常時：Netlifyを直前deployへ、Apps Scriptを前versionへ。追加列はadditiveなので残してよい。
+
+## 出力フォーマット
+- B-0: 影響範囲・テスト計画・反映手順・ロールバックの短いサマリ（実装しない・停止）。
+- B-1: 変更点サマリ・追加テスト一覧・テスト結果(緑)・回帰チェック結果・反映手順書（反映前・停止）。
+
+注: QR(Android)修正は別タスク。このBには混ぜない（別途、別メッセージで指示する）。
